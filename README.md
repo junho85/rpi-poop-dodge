@@ -86,6 +86,30 @@ sudo python3 hello-fb.py "아무 문장이나"
 
 프레임버퍼 탐색 → RGB565 변환 → 나눔 폰트까지 세 가지를 한 파일로 보여줍니다.
 
+### `pygame-on-lcd.py` — pygame 게임을 LCD에서 돌리는 런처
+
+**게임 코드를 한 줄도 고치지 않고** pygame 게임을 SPI LCD에서 실행합니다.
+
+```bash
+sudo python3 pygame-on-lcd.py your-game.py
+sudo python3 pygame-on-lcd.py your-game.py --key J     # 터치를 보낼 문자 (기본 J)
+sudo python3 pygame-on-lcd.py your-game.py --no-touch  # 터치 주입 끄기
+```
+
+SDL2 에는 fbdev 백엔드가 없어서 pygame 이 `/dev/fbN` 에 직접 못 그립니다. 그래서
+`SDL_VIDEODRIVER=dummy` 로 창 없이 띄우고, `display.flip()` 을 후크해 완성된 Surface 를
+RGB565 로 변환해 프레임버퍼에 복사합니다. 게임 화면이 LCD 와 크기가 다르면 자동 스케일합니다.
+
+덤으로 세 가지를 더 처리합니다.
+
+| 가로채는 것 | 처리 |
+|---|---|
+| `serial.Serial('COM4')` | 윈도우 포트명을 `/dev/ttyACM*` 로 자동 교체. 장치가 없으면 터치만으로 플레이 |
+| `pygame.image.load()` | 없는 리소스는 자리표시 Surface 로 대체 (그림이 없어도 일단 돌아간다) |
+| LCD 터치 | 탭을 시리얼 문자로 주입 → **아두이노 버튼과 동일한 입력**. 실제 시리얼과 병행 |
+
+윈도우에서 만든 pygame 게임을 라즈베리파이 LCD 로 옮길 때 그대로 쓸 수 있습니다.
+
 ### `lcd-status.py` — 상태 표시 화면
 
 호스트명·IP·CPU 온도·클록·스로틀링·부하·메모리·디스크·업타임을 LCD에 띄웁니다.
