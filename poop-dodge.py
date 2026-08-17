@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import random
 import struct
@@ -87,12 +88,24 @@ def find_fb() -> tuple[str, int, int]:
 
 
 class Screen:
+    """프레임버퍼에 직접 그리는 화면.
+
+    ⚠️ 전체 프레임을 매번 쓰면 화면이 찢어진다(tearing). fbtft 는 vsync 가 없고
+    자체 주기(드라이버 fps)로 dirty 영역을 SPI 로 밀어내는데, 그 전송 중에 앱이
+    다음 프레임을 덮어쓰면 위/아래가 서로 다른 프레임이 되어 캐릭터 머리가
+    잘린 것처럼 보인다. 그래서 두 가지를 한다.
+      1. 이전 프레임과 비교해 **변경된 행 구간만** seek + write (전송량 급감)
+      2. 드라이버 fps 이상으로 그리지 않는다 (page_flip 호출 측에서 페이싱)
+    """
+
     def __init__(self) -> None:
         self.dev, self.w, self.h = find_fb()
         self.fb = open(self.dev, "wb", buffering=0)
         self.img = Image.new("RGB", (self.w, self.h), BG)
         self.draw = ImageDraw.Draw(self.img)
-        self._fonts: dict[tuple[int, bool], ImageFont.FreeTypeFont] = {}
+        self._fonts: dict[tuple[int, bool, bool], ImageFont.FreeTypeFont] = {}
+        self._prev: "np.ndarray | None" = None
+        self.pushed_rows = 0   # 마지막 flush 에서 실제로 전송한 행 수 (진단용)
 
     def font(self, size: int, bold: bool = False, mono: bool = False) -> ImageFont.FreeTypeFont:
         key = (size, bold, mono)
@@ -126,9 +139,29 @@ class Screen:
 
     def flush(self) -> None:
         a = np.asarray(self.img, dtype=np.uint16)
-        rgb565 = ((a[:, :, 0] >> 3) << 11) | ((a[:, :, 1] >> 2) << 5) | (a[:, :, 2] >> 3)
-        self.fb.seek(0)
-        self.fb.write(rgb565.astype("<u2").tobytes())
+        cur = (((a[:, :, 0] >> 3) << 11)
+               | ((a[:, :, 1] >> 2) << 5)
+               | (a[:, :, 2] >> 3)).astype("<u2")
+
+        if self._prev is None:                      # 첫 프레임은 전체 전송
+            self.fb.seek(0)
+            self.fb.write(cur.tobytes())
+            self.pushed_rows = self.h
+        else:
+            rows = np.flatnonzero(np.any(cur != self._prev, axis=1))
+            if len(rows):
+                # 가까운 구간은 합쳐서 보낸다. seek 왕복보다 몇 줄 더 보내는 게 싸다.
+                splits = np.flatnonzero(np.diff(rows) > 12) + 1
+                pushed = 0
+                for part in np.split(rows, splits):
+                    y0, y1 = int(part[0]), int(part[-1]) + 1
+                    self.fb.seek(y0 * self.w * 2)
+                    self.fb.write(cur[y0:y1].tobytes())
+                    pushed += y1 - y0
+                self.pushed_rows = pushed
+            else:
+                self.pushed_rows = 0
+        self._prev = cur
 
 
 # --------------------------------------------------------------------- touch
@@ -344,6 +377,11 @@ class Game:
     PLAYER_R = 17
     PLAYER_Y_MARGIN = 26
     LIVES = 3
+    # 손가락 추종 속도. 지수 보간이라 프레임레이트가 흔들려도 체감이 같다.
+    # 값이 클수록 즉각적. 11 로 두면 "늦게 따라오는" 느낌이 난다.
+    FOLLOW_K = 26.0
+    # 아무리 멀어도 이 속도 이상으로는 따라온다 (px/s). 먼 거리에서의 답답함 제거.
+    FOLLOW_MIN_SPEED = 900.0
 
     def __init__(self, scr: Screen, touch: Touch, calib: Calibration) -> None:
         self.scr, self.touch, self.calib = scr, touch, calib
@@ -359,6 +397,8 @@ class Game:
         self.elapsed = 0.0
         self.hit_flash = 0.0
         self.over = False
+        self._fps_shown = 0.0
+        self._fps_at = 0.0
 
     # 난이도는 경과 시간으로만 올린다 (점수로 올리면 잘하는 사람만 어려워진다)
     @property
@@ -383,10 +423,16 @@ class Game:
         if self.hit_flash > 0:
             self.hit_flash = max(0.0, self.hit_flash - dt)
 
-        # 이동 — 터치한 x를 향해 부드럽게 따라간다
+        # 이동 — 터치한 x를 향해 따라간다.
+        # 지수 보간(1 - e^-kt)이라 dt 가 흔들려도 추종 체감이 일정하다.
         if self.touch.contact():
             target = self.calib.to_screen_x(self.touch, self.scr.w)
-            self.px += (target - self.px) * min(1.0, dt * 11)
+            gap = target - self.px
+            step = gap * (1.0 - math.exp(-self.FOLLOW_K * dt))
+            floor = self.FOLLOW_MIN_SPEED * dt          # 최소 속도 보장
+            if abs(step) < floor:
+                step = math.copysign(min(floor, abs(gap)), gap)
+            self.px += step
         self.px = min(max(self.px, self.PLAYER_R), self.scr.w - self.PLAYER_R)
 
         self.spawn_timer -= dt
@@ -451,6 +497,13 @@ class Game:
             d.arc([self.px - 7, y - 1, self.px + 7, y + 10], 20, 160,
                   fill=(30, 30, 36), width=2)
 
+    def hud_fps(self, fps: float) -> float:
+        """표시용 fps. 매 프레임 바꾸면 그 행이 늘 dirty 가 되어 전송량이 는다."""
+        if self.elapsed - self._fps_at > 0.5:
+            self._fps_shown = fps
+            self._fps_at = self.elapsed
+        return self._fps_shown
+
     def draw_hud(self, d: ImageDraw.ImageDraw, fps: float) -> None:
         scr = self.scr
         d.rectangle([0, 0, scr.w, 30], fill=(30, 31, 40))
@@ -462,8 +515,8 @@ class Game:
             cx = scr.w - 20 - i * 22
             colour = SKIN if i < self.lives else (62, 64, 74)
             d.ellipse([cx - 8, 7, cx + 8, 23], fill=colour)
-        d.text((6, scr.h - 15), f"{fps:4.1f} fps", font=scr.font(12, mono=True),
-               fill=(78, 82, 94))
+        d.text((6, scr.h - 15), f"{self.hud_fps(fps):4.1f} fps",
+               font=scr.font(12, mono=True), fill=(78, 82, 94))
 
     def render(self, fps: float) -> None:
         scr = self.scr
@@ -518,13 +571,18 @@ def main() -> None:
     wait_for_tap(touch)
     log("game start")
 
+    # fbtft 드라이버가 실제로 화면을 갱신하는 상한(로그의 fps=33)보다 빠르게 그려도
+    # 화면에는 반영되지 않고 tearing 만 늘어난다. 그 위에 맞춰 페이싱한다.
+    TARGET_FPS = 33.0
+    budget = 1.0 / TARGET_FPS
+
     last = time.monotonic()
     fps = 0.0
     try:
         while True:
-            now = time.monotonic()
-            dt = min(now - last, 0.12)  # 큰 dt로 프레임이 튀면 충돌 판정이 뚫린다
-            last = now
+            frame_start = time.monotonic()
+            dt = min(frame_start - last, 0.12)  # 큰 dt로 프레임이 튀면 충돌 판정이 뚫린다
+            last = frame_start
             fps = fps * 0.85 + (1.0 / dt) * 0.15 if dt > 0 else fps
 
             touch.poll()
@@ -538,6 +596,10 @@ def main() -> None:
                 last = time.monotonic()
                 continue
             game.render(fps)
+
+            spare = budget - (time.monotonic() - frame_start)
+            if spare > 0:
+                time.sleep(spare)
     except KeyboardInterrupt:
         scr.clear()
         scr.centre_text(scr.h // 2 - 12, "BYE", 30, DIM, bold=True)

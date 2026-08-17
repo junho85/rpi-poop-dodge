@@ -73,6 +73,19 @@ sudo systemctl stop lcd-status
 
 ## 같이 들어있는 도구
 
+### `hello-fb.py` — 프레임버퍼 최소 예제
+
+세팅이 끝났는지 확인하는 가장 빠른 방법입니다. LCD에 한글 한 줄을 띄웁니다.
+
+```bash
+sudo python3 hello-fb.py
+# framebuffer: /dev/fb0  480x320
+
+sudo python3 hello-fb.py "아무 문장이나"
+```
+
+프레임버퍼 탐색 → RGB565 변환 → 나눔 폰트까지 세 가지를 한 파일로 보여줍니다.
+
 ### `lcd-status.py` — 상태 표시 화면
 
 호스트명·IP·CPU 온도·클록·스로틀링·부하·메모리·디스크·업타임을 LCD에 띄웁니다.
