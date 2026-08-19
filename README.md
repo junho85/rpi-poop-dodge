@@ -141,6 +141,20 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload && sudo systemctl enable --now lcd-status
 ```
 
+### `arduino-controller/` — 물리 버튼 조종기
+
+게임을 아두이노 버튼으로 조작한다. 아두이노가 버튼을 읽어 **시리얼로 문자 하나**(`'J'`)를
+보내고, 게임의 `ser.read()` 가 그걸 받는다.
+
+```
+[버튼] → 아두이노 UNO → USB 시리얼 9600bps → 게임
+```
+
+배선은 두 개뿐 — **버튼 한쪽 다리 D2, 다른쪽 GND.** `INPUT_PULLUP` 을 쓰므로 저항이 필요 없다.
+스케치·배선·트러블슈팅은 [`arduino-controller/README.md`](arduino-controller/README.md) 참고.
+
+조종기가 없어도 `pygame-on-lcd.py` 가 **LCD 터치 탭을 같은 문자로 주입**하므로 플레이는 된다.
+
 ### `touch-dump.py` — 터치 이벤트 진단
 
 터치가 안 잡힐 때 **추측하지 않고 확인하는** 도구입니다. LCD에 `TOUCH NOW`를 띄우고 지정 시간 동안 raw 이벤트를 배치 단위로 출력합니다.
