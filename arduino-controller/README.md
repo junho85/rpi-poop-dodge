@@ -4,16 +4,31 @@
 **시리얼로 문자 하나**를 보내고, Pi 쪽 게임이 그 글자를 입력으로 받는다.
 
 ```
-[버튼] → 아두이노 UNO → USB 시리얼 9600bps → 라즈베리파이 게임
-                          'J' 한 글자
+[◀ 버튼] D2 ─┐
+[▶ 버튼] D3 ─┴→ 아두이노 UNO → USB 시리얼 9600bps → 라즈베리파이 게임
+                              'L' 'l' 'R' 'r'
 ```
 
-## 배선 — 버튼 하나, 저항 없이
+## 프로토콜 — 누름과 뗌을 각각 보낸다
+
+| 버튼 | 누를 때 | 뗄 때 |
+|---|---|---|
+| 왼쪽 (D2) | `L` | `l` |
+| 오른쪽 (D3) | `R` | `r` |
+
+**뗌을 함께 보내는 이유** — "누르고 있는 동안 이동"을 하려면 게임이 상태를 알아야 한다.
+누름만 보내면 게임은 언제 멈춰야 할지 알 수 없다.
+
+문자 하나만 받는 게임(점프 한 종류 등)에 붙일 때는 `release` 를 `0` 으로 두고 `press` 를
+그 문자로 바꾼다. `0` 이면 뗄 때 아무것도 보내지 않는다.
+
+## 배선 — 버튼당 두 가닥, 저항 없이
 
 | 버튼 | 아두이노 |
 |---|---|
-| 한쪽 다리 | **D2** |
-| 다른쪽 다리 | **GND** |
+| 왼쪽 한쪽 다리 | **D2** |
+| 오른쪽 한쪽 다리 | **D3** |
+| 각 버튼의 다른쪽 다리 | **GND** |
 
 `INPUT_PULLUP` 을 쓰기 때문에 **풀업 저항을 따로 달지 않는다.** 누르지 않으면 `HIGH`,
 누르면 `GND` 로 떨어져 `LOW` 다.
@@ -23,18 +38,29 @@
 
 ## 업로드
 
-1. Arduino IDE 에서 `controller.ino` 열기
+1. Arduino IDE 에서 **`arduino-controller/arduino-controller.ino`** 열기
 2. **Tools → Board → Arduino Uno**, **Port** 는 UNO 가 잡힌 포트
 3. 업로드(→) 후 USB 케이블을 라즈베리파이에 옮겨 꽂는다
+
+> ⚠️ **`.ino` 파일명은 폴더명과 같아야 한다.** 다르면 IDE 가 "폴더를 만들어 옮기겠냐"고 묻고,
+> `arduino-cli` 는 `main file missing from sketch` 로 거절한다. 그래서 이 파일명이
+> `controller.ino` 가 아니라 `arduino-controller.ino` 다.
+
+명령줄로 하려면,
+
+```bash
+arduino-cli compile --fqbn arduino:avr:uno arduino-controller/
+arduino-cli upload  --fqbn arduino:avr:uno -p /dev/cu.usbmodem1101 arduino-controller/
+```
 
 ## Pi 에서 확인
 
 ```bash
-ls /dev/ttyACM*        # /dev/ttyACM0  (UNO 는 CDC ACM)
-python3 -c "import serial; s=serial.Serial('/dev/ttyACM0',9600,timeout=5); print(s.read(4))"
+ls /dev/ttyACM* /dev/ttyUSB*    # UNO 정품은 ttyACM0, CH340 클론은 ttyUSB0
+python3 -c "import serial; s=serial.Serial('/dev/ttyACM0',9600,timeout=8); print(s.read(8))"
 ```
 
-버튼을 네 번 누르면 `b'JJJJ'` 가 나온다. 안 나오면 아래를 확인한다.
+왼쪽·오른쪽을 한 번씩 누르고 떼면 `b'LlRr'` 가 나온다. 안 나오면 아래를 확인한다.
 
 | 증상 | 확인 |
 |---|---|
@@ -44,10 +70,28 @@ python3 -c "import serial; s=serial.Serial('/dev/ttyACM0',9600,timeout=5); print
 | 계속 눌린 것처럼 동작 | 택트 스위치 다리 쌍을 잘못 꽂았다 (위 참고) |
 | 권한 오류 | `sudo usermod -aG dialout $USER` 후 재로그인, 또는 `sudo` 로 실행 |
 
+## 게임에 붙이기
+
+**`poop-dodge.py` 는 조종기를 자동으로 찾는다.** `/dev/ttyACM*` → `/dev/ttyUSB*` 순으로 열어보고,
+없으면 조용히 터치 모드로 간다. 버튼을 누르고 있는 동안 캐릭터가 그 방향으로 움직인다(430 px/s).
+
+```
+[poop] 조종기 /dev/ttyACM0 연결 (부팅 대기 중)
+```
+
+> ⚠️ **UNO 는 시리얼 포트를 열면 오토리셋이 걸린다.** 부트로더가 잠깐 포트를 잡으므로
+> 게임이 연결 후 1.6초를 기다린 뒤 입력 버퍼를 비운다. 이걸 안 하면 첫 입력이 씹힌다.
+
+pygame 게임은 `pygame-on-lcd.py` 가 처리한다 — 게임 코드의 `serial.Serial('COM4')` 같은
+윈도우 포트명을 실제 장치로 바꿔 끼우므로 **게임 코드를 고칠 필요가 없다.**
+
 ## 왜 이렇게 짰나
 
-- **누르는 순간(엣지)에만 보낸다.** 누르고 있는 동안 계속 보내면 게임에서 연타로 처리된다
+- **상태가 바뀌는 순간(엣지)에만 보낸다.** 누르고 있는 동안 계속 보내면 시리얼이 문자로 가득 차고,
+  게임 쪽에서 연타와 구분할 수 없다. 대신 뗌을 보내 "누르고 있는 상태"를 게임이 유지하게 한다
 - **디바운스 25ms.** 접점은 누르는 순간 수 ms 동안 값이 튄다. 그대로 읽으면 한 번 눌러도 여러 번 잡힌다
+- **버튼을 배열로 뒀다.** 버튼을 늘리려면 `buttons[]` 에 한 줄(`{4, 'A', 'a', HIGH, HIGH, 0}`)만 추가한다
+- **보드 LED 를 켠다.** 하나라도 눌려 있으면 켜지므로, 게임을 띄우기 전에 **배선만으로 확인**할 수 있다
 - **한 글자만 보낸다.** 게임 쪽은 `ser.read()` 로 1바이트를 읽는 구조라, 줄바꿈이나 문자열을 보내면 파싱이 필요해진다
 
 ## 버튼을 늘리려면

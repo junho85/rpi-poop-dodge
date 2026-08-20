@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """똥피하기 — Waveshare 3.5" SPI LCD(fbtft) + ADS7846 터치로 하는 프레임버퍼 게임.
 
-떨어지는 똥을 좌우로 움직여 피한다. 조작은 터치 한 가지뿐 —
-화면을 누른 x 위치로 캐릭터가 따라온다.
+떨어지는 똥을 좌우로 움직여 피한다. 조작은 두 가지 —
+  * 터치. 화면을 누른 x 위치로 캐릭터가 따라온다.
+  * 아두이노 버튼 조종기(있으면 자동 인식). 좌/우 버튼을 누르고 있는 동안 움직인다.
 
 실행.
     sudo systemctl stop lcd-status     # 상태 화면과 프레임버퍼를 다투므로 먼저 정지
     sudo python3 poop-dodge.py
-    sudo python3 poop-dodge.py --recalibrate   # 터치 축을 다시 잡을 때
 
 설계 메모.
   * fb 번호(fb0/fb1)는 부팅마다 바뀐다 → /sys/class/graphics/fb*/name 으로 찾는다.
   * fbtft 프레임버퍼는 RGB565(16bpp)라 PIL RGB 이미지를 직접 변환해 써넣는다.
-  * 터치 raw 값은 0~4095이고 rotate=270 때문에 화면 축과 일치하지 않는다.
-    그래서 첫 실행 때 좌/우를 눌러보게 해서 어느 축·어느 부호인지 직접 알아낸다.
+  * 터치는 픽셀이 아니라 raw ADC 값(0~4095)으로 온다. 커널이 알려주는 0~4095는
+    드라이버 기본값이고 이 패널 실측은 281~3742 다. 실측값을 기본으로 두고,
+    그보다 넓은 값이 들어오면 그때그때 넓힌다(패널이 달라도 몇 번 누르면 맞는다).
+  * 화면 가로축이 ABS_Y 인 패널이라면 오버레이에 swapxy 를 준다.
 """
 from __future__ import annotations
 
 import glob
-import json
 import math
 import os
 import random
 import struct
-import sys
 import time
 from dataclasses import dataclass
 
@@ -37,7 +37,8 @@ def log(msg: str) -> None:
 
 DRIVER = "fb_ili9486"
 TOUCH_NAME = "ADS7846"
-CALIB_PATH = os.path.expanduser("~/.poop-dodge-calib.json")
+# 이 패널(Waveshare 3.5" A V3) 물리 가장자리 실측값. 관측값이 더 넓으면 자동으로 넓힌다.
+RAW_LO, RAW_HI = 281, 3742
 # DejaVu 에는 한글 글리프가 없어 네모(□)로 나온다. 한국 로케일로 설치하면
 # fonts-nanum 이 함께 깔리므로 나눔을 쓴다. (fc-list :lang=ko 로 확인)
 FONT_DIR = "/usr/share/fonts/truetype/nanum"
@@ -187,15 +188,16 @@ class Touch:
         self.pressed = False
         self.tap_count = 0      # 소비되지 않은 "눌림 시작" 횟수
         self.saw_coords = False  # 좌표 이벤트를 한 번이라도 받았는가 (진단용)
+        self.lo, self.hi = RAW_LO, RAW_HI   # 관측되는 대로 넓어진다
 
     def poll(self) -> None:
         """대기 중인 이벤트를 모두 소비하고 최신 상태만 남긴다.
 
         ⚠️ 두 가지 함정을 함께 피한다.
-        1. 눌림 판정은 BTN_TOUCH 하나만 믿는다. 이 ADS7846은 `xohms`(x-plate-ohms)
-           설정이 없어 ABS_PRESSURE 를 항상 0 으로 보고하는데, 이벤트가
-           BTN_TOUCH=1 → ABS_X → ABS_Y → ABS_PRESSURE=0 → SYN 순으로 오기 때문에
-           pressure 로 판정하면 누른 즉시 "뗀 것"으로 덮여버린다.
+        1. 눌림 판정은 BTN_TOUCH 하나만 믿는다. 이벤트가
+           BTN_TOUCH=1 → ABS_X → ABS_Y → ABS_PRESSURE → SYN 순으로 오기 때문에,
+           pressure 로 판정하면 BTN_TOUCH 로 잡은 눌림이 뒤따르는 값에 덮인다.
+           BTN_TOUCH 만 보면 임계값을 고를 일도 없다.
         2. 짧게 톡 누르면 BTN_TOUCH=1 과 =0 이 **한 번의 read 배치에 함께** 들어온다.
            그래서 처리 후 `pressed` 만 보면 항상 False 다. 눌림 시작을 tap_count 로
            latch 해서 호출자가 take_tap() 으로 소비하게 한다.
@@ -213,6 +215,10 @@ class Touch:
                     if code == ABS_X:
                         self.raw_x = value
                         self.saw_coords = True
+                        if value < self.lo:
+                            self.lo = value
+                        elif value > self.hi:
+                            self.hi = value
                     elif code == ABS_Y:
                         self.raw_y = value
                         self.saw_coords = True
@@ -224,6 +230,13 @@ class Touch:
                     if self.pressed and not was:
                         self.tap_count += 1
 
+
+    def screen_x(self, width: int) -> float:
+        """raw ADC 값을 화면 x 로 옮긴다. 관측 범위를 쓰므로 별도 보정이 필요 없다."""
+        span = self.hi - self.lo
+        if span <= 0:
+            return width / 2
+        return min(max((self.raw_x - self.lo) / span, 0.0), 1.0) * width
 
     def take_tap(self) -> bool:
         """눌림 시작이 있었으면 True 를 주고 카운터를 비운다."""
@@ -237,31 +250,71 @@ class Touch:
         return self.pressed or self.tap_count > 0
 
 
-@dataclass
-class Calibration:
-    axis: str  # 화면 가로축에 대응하는 터치 축 ("x" 또는 "y")
-    lo: int    # 화면 왼쪽에 해당하는 raw 값
-    hi: int    # 화면 오른쪽에 해당하는 raw 값
+class Controller:
+    """아두이노 버튼 조종기. 없으면 없는 대로 굴러간다(터치로 플레이).
 
-    def to_screen_x(self, touch: Touch, width: int) -> float:
-        raw = touch.raw_x if self.axis == "x" else touch.raw_y
-        span = self.hi - self.lo
-        if span == 0:
-            return width / 2
-        return min(max((raw - self.lo) / span, 0.0), 1.0) * width
+    스케치가 버튼을 누를 때 'L'/'R', 뗄 때 'l'/'r' 을 보낸다. 누름·뗌을 둘 다
+    보내는 이유는 "누르고 있는 동안 이동"을 하려면 상태가 필요하기 때문이다.
+    문자 하나만 보내는 1버튼 조종기('J')도 탭으로 받아준다.
+    """
 
-    def save(self) -> None:
-        with open(CALIB_PATH, "w") as f:
-            json.dump({"axis": self.axis, "lo": self.lo, "hi": self.hi}, f)
+    PORT_GLOBS = ("/dev/ttyACM*", "/dev/ttyUSB*")
+    BAUD = 9600
 
-    @staticmethod
-    def load() -> "Calibration | None":
+    def __init__(self) -> None:
+        self.ser = None
+        self.left = False
+        self.right = False
+        self.tap_count = 0
         try:
-            with open(CALIB_PATH) as f:
-                d = json.load(f)
-            return Calibration(d["axis"], int(d["lo"]), int(d["hi"]))
-        except (OSError, KeyError, ValueError):
-            return None
+            import serial
+        except ImportError:
+            log("pyserial 없음 → 조종기 비활성 (터치로 플레이)")
+            return
+        for pattern in self.PORT_GLOBS:
+            for path in sorted(glob.glob(pattern)):
+                try:
+                    self.ser = serial.Serial(path, self.BAUD, timeout=0)
+                except OSError as exc:
+                    log(f"조종기 {path} 열기 실패: {exc}")
+                    continue
+                # UNO 는 시리얼 연결 때 오토리셋이 걸려 부트로더가 잠깐 잡는다.
+                log(f"조종기 {path} 연결 (부팅 대기 중)")
+                time.sleep(1.6)
+                self.ser.reset_input_buffer()
+                return
+        log("조종기 없음 → 터치로 플레이")
+
+    def poll(self) -> None:
+        if self.ser is None:
+            return
+        try:
+            data = self.ser.read(64)
+        except OSError:
+            return
+        for ch in data.decode("ascii", "ignore"):
+            if ch == "L":
+                self.left = True
+                self.tap_count += 1
+            elif ch == "l":
+                self.left = False
+            elif ch == "R":
+                self.right = True
+                self.tap_count += 1
+            elif ch == "r":
+                self.right = False
+            elif ch == "J":          # 1버튼 조종기
+                self.tap_count += 1
+
+    def dx(self) -> int:
+        """-1 왼쪽 · +1 오른쪽 · 0 정지. 양쪽을 같이 누르면 0."""
+        return (1 if self.right else 0) - (1 if self.left else 0)
+
+    def take_tap(self) -> bool:
+        if self.tap_count:
+            self.tap_count = 0
+            return True
+        return False
 
 
 def wait_release(touch: Touch, what: str = "") -> None:
@@ -293,74 +346,20 @@ def wait_press(touch: Touch, on_idle=None) -> None:
         time.sleep(0.01)
 
 
-def draw_target(scr: Screen, touch: Touch, label: str, side: int) -> None:
-    scr.clear()
-    scr.draw.rectangle([0, 0, scr.w, 46], fill=RASPBERRY)
-    scr.centre_text(12, "TOUCH CALIBRATION", 20, WHITE, bold=True)
-    box_w = scr.w // 3
-    x0 = 0 if side == 0 else scr.w - box_w
-    scr.draw.rectangle([x0, 70, x0 + box_w, scr.h - 66], fill=(52, 56, 68))
-    scr.draw.rectangle([x0, 70, x0 + box_w, scr.h - 66], outline=GOLD, width=3)
-    arrow = "<<<" if side == 0 else ">>>"
-    f = scr.font(44, bold=True)
-    bb = scr.draw.textbbox((0, 0), arrow, font=f)
-    scr.draw.text((x0 + (box_w - (bb[2] - bb[0])) // 2 - bb[0], (scr.h - 46) // 2),
-                  arrow, font=f, fill=GOLD)
-    scr.centre_text(scr.h - 56, f"{label} 칸을 손가락으로 누르세요", 18, WHITE)
-    state = "TOUCH" if touch.pressed else "----"
-    scr.centre_text(scr.h - 34, f"[{state}]  raw {touch.raw_x:>4},{touch.raw_y:>4}", 15,
-                    GREEN if touch.pressed else DIM, mono=True)
-    scr.centre_text(scr.h - 14, f"{side + 1} / 2 단계", 13, DIM)
-    scr.flush()
-
-
-def calibrate(scr: Screen, touch: Touch) -> Calibration:
-    """좌/우를 차례로 눌러보게 해서 화면 가로축에 대응하는 터치 축과 부호를 찾는다."""
-    log("calibration start")
-    samples: list[tuple[int, int]] = []
-    for label, side in (("왼쪽", 0), ("오른쪽", 1)):
-        log(f"step {side + 1}: waiting for release before showing target")
-        wait_release(touch, "before target")
-
-        log(f"step {side + 1}: target shown, waiting for press")
-        draw_target(scr, touch, label, side)
-        wait_press(touch, on_idle=lambda: draw_target(scr, touch, label, side))
-        log(f"step {side + 1}: pressed at raw=({touch.raw_x},{touch.raw_y}) "
-            f"held={touch.pressed}")
-
-        if touch.pressed:        # 누르고 있으면 좌표가 안정될 시간을 준다
-            time.sleep(0.2)
-            touch.poll()
-        # 톡 눌렀다 뗀 경우엔 raw_x/raw_y 가 접촉 시점 좌표로 남아있으므로 그대로 쓴다
-        samples.append((touch.raw_x, touch.raw_y))
-        log(f"step {side + 1}: sampled {samples[-1]}")
-
-        draw_target(scr, touch, label, side)   # TOUCH 상태를 화면에 보여준다
-        wait_release(touch, f"step {side + 1}")
-
-    (lx, ly), (rx, ry) = samples
-    axis = "x" if abs(rx - lx) >= abs(ry - ly) else "y"
-    lo, hi = (lx, rx) if axis == "x" else (ly, ry)
-    log(f"samples left={samples[0]} right={samples[1]} -> axis={axis} lo={lo} hi={hi}")
-    if abs(hi - lo) < 200:
-        log("delta too small, falling back to axis=x 0..4095")
-        axis, lo, hi = "x", 0, Touch.RAW_MAX
-    calib = Calibration(axis, lo, hi)
-    calib.save()
-    log(f"calibration saved to {CALIB_PATH}")
-
-    scr.clear()
-    scr.centre_text(scr.h // 2 - 46, "터치 보정 완료", 30, GREEN, bold=True)
-    scr.centre_text(scr.h // 2 - 4, f"axis={axis}  lo={lo}  hi={hi}", 17, WHITE, mono=True)
-    scr.centre_text(scr.h // 2 + 30, "화면을 누르면 계속", 17, DIM)
-    scr.flush()
-    wait_for_tap(touch)
-    return calib
-
-
-def wait_for_tap(touch: Touch) -> None:
+def wait_for_tap(touch: Touch, ctrl: "Controller | None" = None) -> None:
     wait_release(touch, "before tap")
-    wait_press(touch)
+    if ctrl is not None:
+        ctrl.poll()
+        ctrl.take_tap()          # 대기 전에 남은 입력을 버린다
+    while True:
+        touch.poll()
+        if touch.pressed or touch.take_tap():
+            return
+        if ctrl is not None:
+            ctrl.poll()
+            if ctrl.take_tap():
+                return
+        time.sleep(0.01)
 
 
 # ---------------------------------------------------------------------- game
@@ -382,9 +381,11 @@ class Game:
     FOLLOW_K = 26.0
     # 아무리 멀어도 이 속도 이상으로는 따라온다 (px/s). 먼 거리에서의 답답함 제거.
     FOLLOW_MIN_SPEED = 900.0
+    # 조종기 버튼을 누르고 있을 때의 이동 속도 (px/s). 화면 폭을 약 1.1초에 횡단.
+    BUTTON_SPEED = 430.0
 
-    def __init__(self, scr: Screen, touch: Touch, calib: Calibration) -> None:
-        self.scr, self.touch, self.calib = scr, touch, calib
+    def __init__(self, scr: Screen, touch: Touch, ctrl: "Controller | None" = None) -> None:
+        self.scr, self.touch, self.ctrl = scr, touch, ctrl
         self.reset()
 
     def reset(self) -> None:
@@ -423,16 +424,26 @@ class Game:
         if self.hit_flash > 0:
             self.hit_flash = max(0.0, self.hit_flash - dt)
 
-        # 이동 — 터치한 x를 향해 따라간다.
+        # 이동 — 조종기 버튼이 우선, 없으면 터치한 x를 향해 따라간다.
         # 지수 보간(1 - e^-kt)이라 dt 가 흔들려도 추종 체감이 일정하다.
-        if self.touch.contact():
-            target = self.calib.to_screen_x(self.touch, self.scr.w)
+        dx = self.ctrl.dx() if self.ctrl is not None else 0
+        if dx:
+            self.px += dx * self.BUTTON_SPEED * dt
+            # ⚠️ 조종기로 조작하는 동안 남은 터치 latch 를 버린다. 안 버리면 버튼을
+            # 뗀 순간 아래 분기가 살아나 캐릭터가 마지막 터치 위치로 끌려간다.
+            self.touch.take_tap()
+        elif self.touch.contact():
+            target = self.touch.screen_x(self.scr.w)
             gap = target - self.px
             step = gap * (1.0 - math.exp(-self.FOLLOW_K * dt))
             floor = self.FOLLOW_MIN_SPEED * dt          # 최소 속도 보장
             if abs(step) < floor:
                 step = math.copysign(min(floor, abs(gap)), gap)
             self.px += step
+            # 톡 눌렀다 뗀 탭은 목표에 도달하면 소비한다. 안 하면 latch 가 영구히
+            # 남아 손을 뗀 뒤에도 contact() 가 계속 True 다.
+            if not self.touch.pressed and abs(gap) < 2.0:
+                self.touch.take_tap()
         self.px = min(max(self.px, self.PLAYER_R), self.scr.w - self.PLAYER_R)
 
         self.spawn_timer -= dt
@@ -560,15 +571,12 @@ def main() -> None:
     scr = Screen()
     touch = Touch()
 
-    calib = None if "--recalibrate" in sys.argv else Calibration.load()
-    if calib is None:
-        calib = calibrate(scr, touch)
-
-    log(f"calib in use: axis={calib.axis} lo={calib.lo} hi={calib.hi}")
-    game = Game(scr, touch, calib)
+    ctrl = Controller()
+    log(f"touch range: {touch.lo}..{touch.hi} (관측되는 대로 넓어진다)")
+    game = Game(scr, touch, ctrl)
     game.title()
     log("title shown, waiting for tap")
-    wait_for_tap(touch)
+    wait_for_tap(touch, ctrl)
     log("game start")
 
     # fbtft 드라이버가 실제로 화면을 갱신하는 상한(로그의 fps=33)보다 빠르게 그려도
@@ -586,12 +594,13 @@ def main() -> None:
             fps = fps * 0.85 + (1.0 / dt) * 0.15 if dt > 0 else fps
 
             touch.poll()
+            ctrl.poll()
             game.update(dt)
             if game.over:
                 log(f"game over: score={int(game.score)} dodged={game.dodged} "
                     f"level={game.level} fps={fps:.1f}")
                 game.render_gameover()
-                wait_for_tap(touch)
+                wait_for_tap(touch, ctrl)
                 game.reset()
                 last = time.monotonic()
                 continue
