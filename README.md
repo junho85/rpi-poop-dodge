@@ -13,7 +13,7 @@ X도, 데스크톱도, 게임 라이브러리도 쓰지 않습니다. **프레�
 | 보드 | Raspberry Pi 3 Model B Rev 1.2 (1GB) |
 | 디스플레이 | Waveshare(SpotPear) 3.5inch RPi LCD (A) V3 — ILI9486, 480×320 |
 | 터치 | ADS7846 호환 저항막 |
-| OS | Raspbian GNU/Linux 13 (trixie), 커널 6.18, **armhf(32비트) userland** |
+| OS | Debian/Raspbian 13 (trixie), 커널 6.18 — **32비트(armhf)·64비트(arm64) 양쪽에서 확인** |
 | 오버레이 | `dtoverlay=piscreen` |
 | 성능 | 약 40 fps |
 
@@ -35,10 +35,11 @@ grep -l fb_ili9486 /sys/class/graphics/fb*/name   # 예: /sys/class/graphics/fb0
 cat /proc/bus/input/devices | grep -A1 ADS7846
 ```
 
-의존성은 Raspberry Pi OS desktop 이미지에 이미 들어있습니다. Lite에서는 이렇게 설치합니다.
+PIL·numpy 는 desktop 이미지에 들어있지만 **`fonts-nanum` 은 desktop 에도 없습니다**(한국 로케일로 설치해도 없습니다). 없으면 한글이 에러 없이 네모(□)로 나옵니다.
 
 ```bash
-sudo apt install -y python3-pil python3-numpy fonts-nanum
+sudo apt install -y fonts-nanum                          # desktop
+sudo apt install -y python3-pil python3-numpy fonts-nanum # Lite
 ```
 
 ## 실행
@@ -210,6 +211,10 @@ EVENT_FMT = "llHHi"    # native long → 양쪽에서 자동으로 맞는다
 ```
 
 참고로 **커널이 arm64(`+rpt-rpi-v8`)여도 userland는 32비트일 수 있습니다.** Raspberry Pi OS 32-bit는 Pi 3 이상에서 64비트 커널을 로드합니다. 아키텍처는 `uname -m`이 아니라 `dpkg --print-architecture`로 봐야 합니다.
+
+같은 코드를 64비트 이미지에서도 확인했습니다. 구조체가 **16 → 24바이트로 바뀌는데 코드는 한 줄도 고치지 않았습니다.** `"qqHHi"`로 박았으면 32비트에서, `"iiHHi"`였으면 64비트에서 깨집니다.
+
+> 「SPI LCD 를 쓰려면 32비트를 골라야 한다」는 얘기가 돌아다니는데, 이 방식에는 해당되지 않습니다. 그 제약은 [`fbcp-ili9341`](https://github.com/juj/fbcp-ili9341)(DispmanX 의존 → 64비트 빌드 불가) 얘기고, 여기서는 커널 드라이버(`fbtft`)에 직접 그립니다.
 
 ## 그 외 메모
 
